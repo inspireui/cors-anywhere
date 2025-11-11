@@ -41,8 +41,9 @@ cors_proxy.createServer({
   ],
   redirectSameOrigin: true,
   httpProxyOptions: {
-    // Add X-Forwarded-For, etc. headers to preserve client IP
-    xfwd: true,
+    // Disable xfwd to manually control X-Forwarded-For header
+    // We handle this in cors-anywhere.js to preserve the entire chain
+    xfwd: false,
     proxyTimeout: 15000,
     timeout: 15000
   },
