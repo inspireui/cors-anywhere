@@ -17,7 +17,54 @@ function parseEnvList(env) {
 }
 
 // Set up rate-limiting to avoid abuse of the public CORS Anywhere server.
+// CORSANYWHERE_RATELIMIT limits requests per Origin (see lib/rate-limit.js for the format).
 var checkRateLimit = require('./lib/rate-limit')(process.env.CORSANYWHERE_RATELIMIT);
+
+// CORSANYWHERE_RATELIMIT_PER_IP limits requests per client IP, on top of the per-Origin limit.
+// Format: "<max requests per period> <period in minutes>", e.g. "300 1".
+// Origins listed as unlimited in CORSANYWHERE_RATELIMIT are exempt here too (plain hosts only,
+// /regex/ entries are not matched here).
+var checkIpRateLimit = createIpRateLimit(
+  process.env.CORSANYWHERE_RATELIMIT_PER_IP,
+  process.env.CORSANYWHERE_RATELIMIT
+);
+function createIpRateLimit(config, originConfig) {
+  var match = /^(\d+) (\d+)\s*$/.exec(config || '');
+  if (!match || parseInt(match[2], 10) === 0) {
+    return null;
+  }
+  var maxRequests = parseInt(match[1], 10);
+  var periodInMinutes = parseInt(match[2], 10);
+  var exemptHosts = ((/^\d+ \d+\s+(.+)$/.exec(originConfig || '') || [])[1] || '')
+    .toLowerCase().split(/\s+/).filter(Boolean);
+  var counts = new Map();
+  setInterval(function () {
+    counts.clear();
+  }, periodInMinutes * 60000).unref();
+
+  // Used as handleInitialRequest: returning true means the request was handled (rejected).
+  return function (req, res) {
+    var originHost = (req.headers.origin || '').replace(/^[\w\-]+:\/\//, '').toLowerCase();
+    if (originHost && exemptHosts.indexOf(originHost) !== -1) {
+      return false;
+    }
+    // Traffic arrives via Cloudflare -> Traefik, so the real client IP is in CF-Connecting-IP.
+    var ip = req.headers['cf-connecting-ip'] || req.headers['x-real-ip'] || req.socket.remoteAddress;
+    var count = (counts.get(ip) || 0) + 1;
+    counts.set(ip, count);
+    if (count <= maxRequests) {
+      return false;
+    }
+    res.writeHead(429, 'Too Many Requests', {
+      'access-control-allow-origin': '*',
+      'retry-after': String(periodInMinutes * 60),
+      'content-type': 'text/plain; charset=utf-8',
+    });
+    res.end('Too many requests from ' + ip + '. The limit is ' + maxRequests +
+      (periodInMinutes === 1 ? ' per minute.' : ' per ' + periodInMinutes + ' minutes.'));
+    return true;
+  };
+}
 
 var cors_proxy = require('./lib/cors-anywhere');
 cors_proxy.createServer({
@@ -25,6 +72,7 @@ cors_proxy.createServer({
   originWhitelist: originWhitelist,
   requireHeader: [],
   checkRateLimit: checkRateLimit,
+  handleInitialRequest: checkIpRateLimit,
   removeHeaders: [
     'cookie',
     'cookie2',
@@ -34,14 +82,44 @@ cors_proxy.createServer({
     'via',
     'connect-time',
     'total-route-time',
-    // Other Heroku added debug headers
-    // 'x-forwarded-for',
-    // 'x-forwarded-proto',
-    // 'x-forwarded-port',
+    // Headers added by Cloudflare and Traefik in front of this server (the
+    // per-IP rate limit above reads them first). Forwarded as-is they tell the
+    // target site a Cloudflare edge IP sent the request, which firewalls such
+    // as 20i StackProtect read as spoofing.
+    'x-forwarded-for',
+    'x-forwarded-host',
+    'x-forwarded-port',
+    'x-forwarded-proto',
+    'x-forwarded-server',
+    'x-forwarded-ssl',
+    'x-real-ip',
+    'true-client-ip',
+    'forwarded',
+    'cdn-loop',
+    'cf-connecting-ip',
+    'cf-connecting-ipv6',
+    'cf-ipcountry',
+    'cf-ray',
+    'cf-visitor',
+    'cf-ew-via',
+    'cf-worker',
+    // Browser fingerprint headers: they contradict the user agent set below.
+    'sec-ch-ua',
+    'sec-ch-ua-mobile',
+    'sec-ch-ua-platform',
+    'sec-fetch-dest',
+    'sec-fetch-mode',
+    'sec-fetch-site',
   ],
+  setHeaders: {
+    // Requests leave from a server IP, so a browser user agent makes bot
+    // firewalls (e.g. 20i StackProtect) answer 403. Send the user agent the
+    // mobile app sends instead: every site the app works with accepts it.
+    'user-agent': process.env.CORSANYWHERE_USER_AGENT || 'Dart/3.5 (dart:io)',
+  },
   redirectSameOrigin: true,
   httpProxyOptions: {
-    // Do not add X-Forwarded-For, etc. headers, because Heroku already adds it.
+    // Do not add X-Forwarded-For, etc. headers: the target only needs to see this server.
     xfwd: false,
     proxyTimeout: 15000,
     timeout: 15000
