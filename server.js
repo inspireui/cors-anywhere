@@ -66,8 +66,17 @@ function createIpRateLimit(config, originConfig) {
   };
 }
 
+// CORSANYWHERE_CACHE_TTL: seconds to keep successful GET responses (0 turns the cache off).
+// CORSANYWHERE_CACHE_MAX_MB: memory cap for all cached responses.
+var cacheTtlSeconds = parseInt(process.env.CORSANYWHERE_CACHE_TTL || '60', 10);
+var withCache = cacheTtlSeconds > 0 ? require('./lib/response-cache')({
+  ttlSeconds: cacheTtlSeconds,
+  maxEntryBytes: 5 * 1024 * 1024,
+  maxTotalBytes: parseInt(process.env.CORSANYWHERE_CACHE_MAX_MB || '100', 10) * 1024 * 1024,
+}) : null;
+
 var cors_proxy = require('./lib/cors-anywhere');
-cors_proxy.createServer({
+var server = cors_proxy.createServer({
   originBlacklist: originBlacklist,
   originWhitelist: originWhitelist,
   requireHeader: [],
@@ -124,6 +133,16 @@ cors_proxy.createServer({
     proxyTimeout: 15000,
     timeout: 15000
   },
-}).listen(port, host, function () {
-  console.log('Running CORS Anywhere on ' + host + ':' + port);
+});
+
+if (withCache) {
+  // Cache hits are answered before the rate limits run: they cost the target site nothing.
+  var corsHandler = server.listeners('request')[0];
+  server.removeAllListeners('request');
+  server.on('request', withCache(corsHandler));
+}
+
+server.listen(port, host, function () {
+  console.log('Running CORS Anywhere on ' + host + ':' + port +
+    (withCache ? ' (cache ' + cacheTtlSeconds + 's)' : ''));
 });
